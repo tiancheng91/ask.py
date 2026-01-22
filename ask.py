@@ -12,8 +12,11 @@ warnings.filterwarnings("ignore", message=".*urllib3.*OpenSSL.*")
 warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 
 import asyncio
+import hashlib
 import json
 import os
+import random
+import string
 import sys
 import time
 from datetime import datetime
@@ -497,11 +500,54 @@ Please output merged refined summary (1-2 sentences):"""
 
 # ==================== 配置管理 ====================
 
+def generate_public_api_key() -> str:
+    """生成公共 API Key
+    格式: 12位随机数-版本号-md5前6位
+    """
+    # 第一段：12位随机数（数字和字母）
+    random_id = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+    
+    # 第二段：版本号（固定为1）
+    version = "1"
+    
+    # 第三段：md5前6位（对随机ID+版本号+固定字符串进行md5）
+    # 使用固定字符串 "ask-py-cli" 作为 salt
+    salt = "ask-py-cli"
+    hash_input = f"{random_id}-{version}-{salt}"
+    md5_hash = hashlib.md5(hash_input.encode()).hexdigest()
+    md5_prefix = md5_hash[:6]
+    
+    return f"{random_id}-{version}-{md5_prefix}"
+
+
 @lru_cache(maxsize=1)
 def load_config() -> dict:
     """加载模型配置文件，结果会被缓存"""
     if not CONFIG_FILE.exists():
-        return {"models": {}, "default": None, "default_role": None, "lang": None}
+        # 首次使用时创建默认配置
+        default_config = {
+            "models": {},
+            "default": None,
+            "default_role": None,
+            "lang": None
+        }
+        
+        # 创建默认公共模型（仅用于快速体验）
+        public_api_key = generate_public_api_key()
+        default_config["models"]["public"] = {
+            "api_base": "https://ask.appsvc.net/v1",
+            "api_key": public_api_key,
+            "model": "glm-4-flash",
+            "temperature": 0.7
+        }
+        default_config["default"] = "public"
+        
+        # 保存默认配置
+        save_config(default_config)
+        # 清除缓存以确保下次读取最新配置
+        load_config.cache_clear()
+        
+        return default_config
     
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}

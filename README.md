@@ -32,7 +32,21 @@ pipx install ask-py-cli
 uv tool install ask-py-cli
 ```
 
-### 2. 添加模型
+### 2. 开始使用
+
+安装后即可直接使用，首次运行会自动创建默认配置：
+
+```bash
+# 直接提问（使用默认的 public 模型）
+ask "什么是 Python？"
+```
+
+> ⚠️ **重要提示**: 
+> - 默认的 `public(glm-4-flash)` 模型仅用于**快速体验**，有 **IP 维度频次限制**（动态调整）
+> - **长期使用建议配置自己的 API 密钥**，避免频次限制影响使用
+> - 支持任何 OpenAI 兼容接口：OpenAI、Azure OpenAI、DeepSeek、智谱 GLM、Ollama 等
+
+#### 添加自己的模型
 
 ```bash
 ask model add openai \
@@ -180,11 +194,36 @@ ask role clear-memory NAME --confirm
 
 ### config.yaml 示例
 
+首次运行会自动创建默认配置：
+
+```yaml
+default: public
+lang: zh-cn  # 语言设置: en, zh-cn, zh-tw (默认根据系统 $LANG 自动检测)
+models:
+  public:
+    api_base: https://ask.appsvc.net/v1
+    api_key: <自动生成的密钥>
+    model: glm-4-flash
+    temperature: 0.7
+```
+
+> ⚠️ **重要提示**: 
+> - `public(glm-4-flash)` 模型仅用于快速体验，有 IP 维度频次限制（动态调整）
+> - 长期使用建议添加自己的模型配置，使用自己的 API 密钥
+> - 可以添加多个模型，通过 `ask model default <name>` 切换默认模型
+
+添加自己的模型后：
+
 ```yaml
 default: openai
 default_role: shell
-lang: zh-cn  # 语言设置: en, zh-cn, zh-tw (默认根据系统 $LANG 自动检测)
+lang: zh-cn
 models:
+  public:
+    api_base: https://ask.appsvc.net/v1
+    api_key: <自动生成的密钥>
+    model: glm-4-flash
+    temperature: 0.7
   openai:
     api_base: https://api.openai.com/v1
     api_key: sk-xxx

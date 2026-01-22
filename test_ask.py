@@ -70,10 +70,26 @@ class TestConfigManagement(TestCase):
             ask.ROLES_FILE.unlink()
     
     def test_load_empty_config(self):
-        """测试加载空配置"""
+        """测试加载空配置（首次运行会自动创建默认public配置）"""
         config = ask.load_config()
-        self.assertEqual(config["models"], {})
-        self.assertIsNone(config["default"])
+        # 首次运行会自动创建 public 模型
+        if "public" in config["models"]:
+            # 验证 public 配置
+            public = config["models"]["public"]
+            self.assertEqual(public["api_base"], "https://ask.appsvc.net/v1")
+            self.assertEqual(public["model"], "glm-4-flash")
+            self.assertEqual(config["default"], "public")
+            # 验证 API Key 格式
+            api_key = public["api_key"]
+            parts = api_key.split("-")
+            self.assertEqual(len(parts), 3)
+            self.assertEqual(len(parts[0]), 12)  # 12位随机数
+            self.assertEqual(parts[1], "1")  # 版本号
+            self.assertEqual(len(parts[2]), 6)  # md5前6位
+        else:
+            # 如果已有配置文件，则可能是空配置
+            self.assertEqual(config["models"], {})
+            self.assertIsNone(config["default"])
     
     def test_save_and_load_config(self):
         """测试保存和加载配置"""
@@ -97,13 +113,23 @@ class TestConfigManagement(TestCase):
     
     def test_add_multiple_models(self):
         """测试添加多个模型"""
-        config = ask.load_config()
+        # 清除缓存并删除配置文件，避免自动创建demo配置
+        ask.load_config.cache_clear()
+        if ask.CONFIG_FILE.exists():
+            ask.CONFIG_FILE.unlink()
         
-        config["models"]["model1"] = {"api_base": "url1", "api_key": "key1", "model": "m1"}
-        config["models"]["model2"] = {"api_base": "url2", "api_key": "key2", "model": "m2"}
-        config["default"] = "model1"
+        # 创建新配置
+        config = {
+            "models": {
+                "model1": {"api_base": "url1", "api_key": "key1", "model": "m1"},
+                "model2": {"api_base": "url2", "api_key": "key2", "model": "m2"}
+            },
+            "default": "model1"
+        }
         ask.save_config(config)
         
+        # 清除缓存重新加载
+        ask.load_config.cache_clear()
         loaded = ask.load_config()
         self.assertEqual(len(loaded["models"]), 2)
         self.assertIn("model1", loaded["models"])

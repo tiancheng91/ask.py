@@ -11,10 +11,14 @@ LangChain ベースのターミナル LLM Q&A ツール。マルチモデル、�
 ## 特徴
 
 - 🚀 クイックターミナル Q&A - `ask "質問"` だけで OK
+- ⚡ ストリーミング出力 - リアルタイムで回答を表示（デフォルトで有効）
 - 🔧 マルチモデル設定 - OpenAI 互換 API をサポート
 - 🎭 カスタム System Prompt 付きロールシステム
 - 🧠 三層メモリシステム（短期/中期/長期）、自動圧縮機能付き
 - 🔌 MCP（Model Context Protocol）ツールサポート
+- 📁 ファイル内容分析 - `-f` パラメータでファイルを読み取り
+- 📊 エラーログ分析 - stdin から読み取りをサポート
+- 🌍 コンテキスト認識 - 作業ディレクトリ、環境変数などを自動注入
 
 ## クイックスタート
 
@@ -28,7 +32,21 @@ pipx install ask-py-cli
 uv tool install ask-py-cli
 ```
 
-### 2. モデルを追加
+### 2. 使い始める
+
+インストール後すぐに使用できます。初回実行時にデフォルト設定が自動作成されます：
+
+```bash
+# 質問する（デフォルトの public モデルを使用）
+ask "Python とは？"
+```
+
+> ⚠️ **重要な注意事項**: 
+> - デフォルトの `public(glm-4-flash)` モデルは**クイック体験専用**で、**IP ベースのレート制限**があります（動的に調整）
+> - **長期使用には独自の API キーを設定することを推奨**します。レート制限の影響を避けるため
+> - あらゆる OpenAI 互換 API をサポート：OpenAI、Azure OpenAI、DeepSeek、GLM、Ollama など
+
+#### 独自のモデルを追加
 
 ```bash
 ask model add openai \
@@ -38,7 +56,7 @@ ask model add openai \
     --set-default
 ```
 
-### 3. 使い始める
+### 3. 使用例
 
 ```bash
 # 質問する
@@ -68,6 +86,62 @@ ask [OPTIONS] "質問"
   -r, --role TEXT    指定したロールを使用
   -t, --tools        MCP ツールを有効化
   --mcp NAME         MCP サーバーを指定（複数回使用可）
+  --no-stream        ストリーミング出力を無効化（完全な結果を一度に表示）
+  -f, --file TEXT    ファイル内容を読み取って分析
+  --stdin            stdin から追加の入力を読み取る（エラー分析など）
+```
+
+### 使用例
+
+#### 日常的な Q&A
+```bash
+# クイック質問（ストリーミング出力、リアルタイム表示）
+ask "Python のジェネレータとは？"
+ask "RESTful API 設計原則を説明"
+```
+
+#### コード分析
+```bash
+# 単一ファイルを分析
+ask -f main.py "このファイルの機能を説明"
+ask "このコードのパフォーマンスを最適化" -f utils.py
+
+# 設定ファイルを分析
+ask -f docker-compose.yml "設定が正しいか確認"
+ask -f package.json "依存関係を説明"
+```
+
+#### エラー診断
+```bash
+# エラーログを分析
+cat error.log | ask "このエラーを分析" --stdin
+python script.py 2>&1 | ask "このエラーを説明" --stdin
+
+# アプリケーションログを分析
+tail -n 100 app.log | ask "パフォーマンスのボトルネックを特定" --stdin
+journalctl -u myapp -n 50 | ask "サービス問題を分析" --stdin
+```
+
+#### システム管理支援
+```bash
+# シェルロールを使用してシステム管理対話
+ask role add shell -s "あなたはシステム管理者アシスタントです。ユーザーがシステム関連の質問（ファイル操作、プロセス管理、システム情報クエリなど）をした場合、他のプログラミング言語コードで実装するのではなく、シェルコマンドを使用して解決することを優先します。" --set-default
+ask "ディスク使用量が最も大きいディレクトリを特定"
+ask "すべてのリスニングポートをリスト"  # コンテキストを自動記憶
+
+# システム問題の診断
+ask -r shell "/tmp ディレクトリで 7 日を超えるファイルをクリーンアップ"
+ask -r shell "システム負荷を確認して原因を特定"
+```
+
+#### ツール統合
+```bash
+# MCP ツールを使用
+ask -t "今何時？"  # 時刻をクエリ
+ask --mcp shell "現在のディレクトリの Python ファイルをリスト"
+
+# 組み合わせて使用
+ask -f requirements.txt "依存関係の競合を確認" --no-stream | tee analysis.txt
 ```
 
 ### モデル管理
@@ -106,11 +180,36 @@ ask role clear-memory NAME --confirm
 
 ### config.yaml の例
 
+初回実行時にデフォルト設定が自動作成されます：
+
 ```yaml
-default: openai
-default_role: coder
+default: public
 lang: ja  # 言語: en, zh-cn, zh-tw, ja（デフォルトは $LANG から自動検出）
 models:
+  public:
+    api_base: https://ask.appsvc.net/v1
+    api_key: <自動生成されたキー>
+    model: glm-4-flash
+    temperature: 0.7
+```
+
+> ⚠️ **重要な注意事項**: 
+> - `public(glm-4-flash)` モデルはクイック体験専用で、IP ベースのレート制限があります（動的に調整）
+> - 長期使用には独自のモデル設定を追加し、独自の API キーを使用することを推奨します
+> - 複数のモデルを追加でき、`ask model default <name>` でデフォルトモデルを切り替えられます
+
+独自のモデルを追加した後：
+
+```yaml
+default: openai
+default_role: shell
+lang: ja
+models:
+  public:
+    api_base: https://ask.appsvc.net/v1
+    api_key: <自動生成されたキー>
+    model: glm-4-flash
+    temperature: 0.7
   openai:
     api_base: https://api.openai.com/v1
     api_key: sk-xxx
@@ -130,6 +229,52 @@ models:
 1. 設定ファイルの `lang` 設定
 2. 環境変数 `$LANG`
 3. デフォルトは英語
+
+## コア機能
+
+### ストリーミング出力
+
+デフォルトでストリーミング出力が有効で、回答内容をリアルタイムで表示します：
+
+```bash
+ask "量子コンピューティングの原理を説明"  # リアルタイム表示、完全な応答を待つ必要なし
+ask "詳細な説明" --no-stream  # ストリーミングを無効化、完全な結果を一度に表示
+```
+
+### コンテキスト認識
+
+現在の環境情報を自動注入し、より実際のシナリオに合った回答を提供します：
+
+- 現在の作業ディレクトリ
+- オペレーティングシステムと Python バージョン
+- 重要な環境変数（PATH, HOME, USER, SHELL, LANG など）
+
+手動設定は不要で、システムが自動的に識別してコンテキストに追加します。
+
+### ファイル内容分析
+
+コードファイル、設定ファイルなどを直接分析します：
+
+```bash
+ask -f main.py "このファイルを説明"
+ask "このコードを最適化" -f utils.py
+ask -f config.yaml "設定が正しいか確認"
+```
+
+### エラーログ分析
+
+標準入力からエラー情報を読み取って分析します：
+
+```bash
+# エラーログを分析
+cat error.log | ask "このエラーを分析" --stdin
+
+# 最近のログを分析
+tail -n 100 app.log | ask "問題の原因を特定" --stdin
+
+# コマンド出力を分析
+python script.py 2>&1 | ask "このエラーを説明" --stdin
+```
 
 ## メモリシステム
 
@@ -162,17 +307,19 @@ MCP（Model Context Protocol）により、LLM が外部ツールを呼び出せ
       "command": "uvx",
       "args": ["mcp-shell-server"],
       "env": {
-        "ALLOW_COMMANDS": "ls,cat,head,tail,find,grep,wc,pwd,echo,mkdir,cp,mv,touch,date"
+        "ALLOW_COMMANDS": "ls,cat,head,tail,find,grep,wc,pwd,echo,mkdir,cp,mv,touch,date,whoami,hostname,ps,du"
       }
     }
   },
-  "enabled": ["time", "shell"]
+  "enabled": ["time"]
 }
 ```
 
-- `time`: 現在時刻を取得
-- `shell`: システムコマンドを実行（`ALLOW_COMMANDS` で制限）
+- `time`: 現在時刻を取得（デフォルトで有効）
+- `shell`: システムコマンドを実行（`ALLOW_COMMANDS` で制限、デフォルトで無効）
 - 自動検出: `uvx` を優先、なければ `pipx` を使用
+
+> ⚠️ **注意**: `shell` サーバーは実行精度の問題により、デフォルトで無効になっています。使用するには、`--mcp shell` で手動指定するか、設定ファイルの `enabled` に `"shell"` を追加してください。
 
 ### サーバーを追加
 
@@ -194,18 +341,20 @@ MCP（Model Context Protocol）により、LLM が外部ツールを呼び出せ
 ```bash
 ask mcp list              # サーバー一覧
 ask mcp tools shell       # shell ツールの詳細を表示
-ask -t "今何時？"          # デフォルト有効ツールを使用（time + shell）
-ask -t "/tmp のファイル一覧"           # LLM が自動で shell を呼び出す
-ask -t "~/Videos の動画ファイル名を整理" # LLM が計画してコマンドを実行
+ask -t "今何時？"          # デフォルト有効ツールを使用（time）
+ask -t "/tmp のファイル一覧"           # shell サーバーを手動で有効化する必要がある
+ask --mcp shell "現在のディレクトリのファイルをリスト"  # shell サーバーを手動指定
 ```
+
+> ⚠️ **注意**: `shell` サーバーは実行精度の問題により、デフォルトで無効になっています。使用するには、`--mcp shell` で手動指定するか、設定ファイルで有効化してください。
 
 ### ロールレベル MCP
 
 ```yaml
 # ~/.config/ask/roles.yaml
-coder:
-  system_prompt: "あなたはプログラマーです"
-  mcp: ["github"]  # 追加で有効にするサーバー
+shell:
+  system_prompt: "あなたはシステム管理者アシスタントです。ユーザーがシステム関連の質問（ファイル操作、プロセス管理、システム情報クエリなど）をした場合、他のプログラミング言語コードで実装するのではなく、シェルコマンドを使用して解決することを優先します。"
+  mcp: ["shell"]  # コマンドを実行するために shell サーバーを有効化
 ```
 
 ## サポートモデル
