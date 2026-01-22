@@ -1,6 +1,6 @@
 # ask.py
 
-[![PyPI version](https://badge.fury.io/py/ask.py.svg)](https://badge.fury.io/py/ask.py)
+[![PyPI version](https://badge.fury.io/py/ask-py-cli.svg)](https://badge.fury.io/py/ask-py-cli)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -20,10 +20,10 @@
 
 ```bash
 # 使用 pipx（推荐）
-pipx install ask.py
+pipx install ask-py-cli
 
 # 或使用 uv tool
-uv tool install ask.py
+uv tool install ask-py-cli
 ```
 
 ### 2. 配置模型
@@ -205,6 +205,8 @@ uv publish
 pipx install git+https://github.com/tiancheng91/ask.py
 # 或
 uv tool install git+https://github.com/tiancheng91/ask.py
+# 或从 PyPI 安装
+pipx install ask-py-cli
 ```
 
 ## License

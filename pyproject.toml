@@ -1,5 +1,5 @@
 [project]
-name = "ask.py"
+name = "ask-py-cli"
 version = "0.1.0"
 description = "基于 LangChain 的终端 LLM 问答工具，支持多模型、角色记忆和 MCP 工具"
 readme = "README.md"
