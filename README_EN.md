@@ -145,6 +145,8 @@ Roles support three-tier hierarchical memory with automatic conversation history
 
 MCP (Model Context Protocol) enables LLM to call external tools.
 
+> ⚠️ **Note**: Tool mode requires spawning external processes, which is slower. Use `-t` only when needed.
+
 ### Default Configuration
 
 Auto-created on first run at `~/.config/ask/mcp.json`, automatically detects `uvx` or `pipx`:

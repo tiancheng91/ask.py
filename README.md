@@ -145,6 +145,8 @@ models:
 
 MCP（Model Context Protocol）让 LLM 能够调用外部工具。
 
+> ⚠️ **注意**: 工具模式需要启动外部进程，响应速度较慢，建议仅在需要时使用 `-t` 参数。
+
 ### 默认配置
 
 首次运行自动创建 `~/.config/ask/mcp.json`，会自动检测系统中的 `uvx` 或 `pipx` 命令：
