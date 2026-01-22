@@ -136,7 +136,6 @@ def get_default_mcp_config() -> dict:
 
 
 @lru_cache(maxsize=1)
-@lru_cache(maxsize=1)
 def load_mcp_config() -> dict:
     """加载 MCP 服务器配置 (JSON 格式)，结果会被缓存
     
