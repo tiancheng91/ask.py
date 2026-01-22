@@ -16,6 +16,7 @@ import json
 import sys
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -81,19 +82,29 @@ def _get_mcp_classes():
 
 import shutil
 
+# 缓存包运行器检测结果，避免重复检测
+_PACKAGE_RUNNER_CACHE = None
+
 def detect_package_runner() -> str:
-    """检测可用的包运行器（uvx 或 pipx）
+    """检测可用的包运行器（uvx 或 pipx），结果会被缓存
     
     Returns:
         "uvx" 或 "pipx"，优先使用 uvx
     """
+    global _PACKAGE_RUNNER_CACHE
+    
+    if _PACKAGE_RUNNER_CACHE is not None:
+        return _PACKAGE_RUNNER_CACHE
+    
     if shutil.which("uvx"):
-        return "uvx"
+        _PACKAGE_RUNNER_CACHE = "uvx"
     elif shutil.which("pipx"):
-        return "pipx"
+        _PACKAGE_RUNNER_CACHE = "pipx"
     else:
         # 默认返回 uvx，让用户自行安装
-        return "uvx"
+        _PACKAGE_RUNNER_CACHE = "uvx"
+    
+    return _PACKAGE_RUNNER_CACHE
 
 
 def get_default_mcp_config() -> dict:
@@ -121,8 +132,10 @@ def get_default_mcp_config() -> dict:
     }
 
 
+@lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
 def load_mcp_config() -> dict:
-    """加载 MCP 服务器配置 (JSON 格式)
+    """加载 MCP 服务器配置 (JSON 格式)，结果会被缓存
     
     配置文件: ~/.config/ask/mcp.json
     
@@ -481,8 +494,9 @@ Please output merged refined summary (1-2 sentences):"""
 
 # ==================== 配置管理 ====================
 
+@lru_cache(maxsize=1)
 def load_config() -> dict:
-    """加载模型配置文件"""
+    """加载模型配置文件，结果会被缓存"""
     if not CONFIG_FILE.exists():
         return {"models": {}, "default": None, "default_role": None, "lang": None}
     
@@ -509,8 +523,9 @@ def save_config(config: dict) -> None:
         yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
 
 
+@lru_cache(maxsize=1)
 def load_roles() -> dict:
-    """加载角色配置"""
+    """加载角色配置，结果会被缓存"""
     if not ROLES_FILE.exists():
         return {}
     

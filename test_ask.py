@@ -59,6 +59,11 @@ class TestConfigManagement(TestCase):
     
     def setUp(self):
         """每个测试前清理配置"""
+        # 清除所有配置缓存
+        ask.load_config.cache_clear()
+        ask.load_roles.cache_clear()
+        ask.load_mcp_config.cache_clear()
+        
         if ask.CONFIG_FILE.exists():
             ask.CONFIG_FILE.unlink()
         if ask.ROLES_FILE.exists():
@@ -110,6 +115,11 @@ class TestRoleManagement(TestCase):
     
     def setUp(self):
         """每个测试前清理配置"""
+        # 清除所有配置缓存
+        ask.load_config.cache_clear()
+        ask.load_roles.cache_clear()
+        ask.load_mcp_config.cache_clear()
+        
         if ask.ROLES_FILE.exists():
             ask.ROLES_FILE.unlink()
         # 清理记忆目录
