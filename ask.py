@@ -110,6 +110,9 @@ def detect_package_runner() -> str:
 def get_default_mcp_config() -> dict:
     """生成默认 MCP 配置，根据系统环境选择 uvx 或 pipx
     
+    注意：shell 服务器由于执行准确性问题，不默认启用。
+    用户可以根据需要手动在配置中启用。
+    
     Returns:
         默认 MCP 配置字典
     """
@@ -128,7 +131,7 @@ def get_default_mcp_config() -> dict:
                 }
             }
         },
-        "enabled": ["time", "shell"]
+        "enabled": ["time"]  # 只默认启用 time，shell 需要手动启用
     }
 
 
