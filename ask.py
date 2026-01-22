@@ -42,14 +42,40 @@ MCP_FILE = CONFIG_DIR / "mcp.json"
 
 console = Console()
 
-# MCP 可用性标志
-MCP_AVAILABLE = False
-try:
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-    MCP_AVAILABLE = True
-except ImportError:
-    pass
+# MCP 可用性标志（延迟导入）
+MCP_AVAILABLE = None  # None 表示尚未检测
+_mcp_module = None
+_mcp_stdio_module = None
+
+
+def _lazy_import_mcp():
+    """延迟导入 MCP 模块，只在实际使用时加载"""
+    global MCP_AVAILABLE, _mcp_module, _mcp_stdio_module
+    
+    if MCP_AVAILABLE is not None:
+        return MCP_AVAILABLE
+    
+    try:
+        import mcp
+        import mcp.client.stdio
+        _mcp_module = mcp
+        _mcp_stdio_module = mcp.client.stdio
+        MCP_AVAILABLE = True
+    except ImportError:
+        MCP_AVAILABLE = False
+    
+    return MCP_AVAILABLE
+
+
+def _get_mcp_classes():
+    """获取 MCP 相关类，需要先调用 _lazy_import_mcp()"""
+    if not MCP_AVAILABLE:
+        return None, None, None
+    return (
+        _mcp_module.ClientSession,
+        _mcp_module.StdioServerParameters,
+        _mcp_stdio_module.stdio_client
+    )
 
 # ==================== MCP 管理 ====================
 
@@ -191,45 +217,69 @@ def get_mcp_server_by_name(name: str) -> Optional[dict]:
     return mcp_config.get("mcpServers", {}).get(name)
 
 
-async def get_mcp_tools(server_name: str, server_config: dict) -> tuple:
-    """连接 MCP 服务器并获取工具列表"""
-    if server_config.get("type") == "sse":
-        raise RuntimeError("SSE 类型暂不支持，请使用 stdio 类型")
+class MCPConnection:
+    """MCP 连接管理器，支持连接复用"""
     
-    command = server_config.get("command")
-    args = server_config.get("args", [])
-    env = server_config.get("env")
+    def __init__(self, server_name: str, server_config: dict):
+        self.server_name = server_name
+        self.server_config = server_config
+        self.session = None
+        self.tools = []
+        self._context_stack = []
     
-    server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=env
-    )
+    async def connect(self):
+        """建立连接"""
+        if self.server_config.get("type") == "sse":
+            raise RuntimeError("SSE 类型暂不支持，请使用 stdio 类型")
+        
+        ClientSession, StdioServerParameters, stdio_client = _get_mcp_classes()
+        
+        command = self.server_config.get("command")
+        args = self.server_config.get("args", [])
+        env = self.server_config.get("env")
+        
+        server_params = StdioServerParameters(
+            command=command,
+            args=args,
+            env=env
+        )
+        
+        # 进入 stdio_client 上下文
+        stdio_ctx = stdio_client(server_params)
+        read, write = await stdio_ctx.__aenter__()
+        self._context_stack.append(stdio_ctx)
+        
+        # 进入 ClientSession 上下文
+        session_ctx = ClientSession(read, write)
+        self.session = await session_ctx.__aenter__()
+        self._context_stack.append(session_ctx)
+        
+        await self.session.initialize()
+        
+        # 获取工具列表
+        tools_result = await self.session.list_tools()
+        self.tools = tools_result.tools
+        
+        return self.tools
     
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools_result = await session.list_tools()
-            return session, tools_result.tools
-
-
-async def call_mcp_tool(server_config: dict, tool_name: str, arguments: dict) -> Any:
-    """调用 MCP 工具"""
-    command = server_config.get("command")
-    args = server_config.get("args", [])
-    env = server_config.get("env")
+    async def call_tool(self, tool_name: str, arguments: dict) -> Any:
+        """调用工具（复用已建立的连接）"""
+        if not self.session:
+            raise RuntimeError(f"MCP 连接未建立: {self.server_name}")
+        
+        result = await self.session.call_tool(tool_name, arguments)
+        return result
     
-    server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=env
-    )
-    
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments)
-            return result
+    async def close(self):
+        """关闭连接"""
+        # 按逆序退出上下文
+        for ctx in reversed(self._context_stack):
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+        self._context_stack.clear()
+        self.session = None
 
 
 def convert_mcp_tools_to_openai(tools: list) -> list:
@@ -248,62 +298,59 @@ def convert_mcp_tools_to_openai(tools: list) -> list:
     return openai_tools
 
 
-async def collect_tools_from_servers(servers_to_use: List[str]) -> tuple:
-    """从多个 MCP 服务器收集工具
+async def _connect_single_server(server_name: str) -> Optional[MCPConnection]:
+    """连接单个 MCP 服务器（用于并行连接）"""
+    server_config = get_mcp_server_by_name(server_name)
+    if not server_config:
+        return None
+    
+    conn = MCPConnection(server_name, server_config)
+    try:
+        await conn.connect()
+        return conn
+    except Exception as e:
+        console.print(f"[yellow]{t('error.mcp_connect_failed', name=server_name, error=str(e))}[/yellow]")
+        return None
+
+
+async def connect_mcp_servers(servers_to_use: List[str]) -> tuple:
+    """并行连接多个 MCP 服务器
     
     Returns:
-        (all_tools, tool_to_server): 所有工具列表和工具名到服务器配置的映射
+        (connections, all_tools, tool_to_connection): 
+        连接列表、所有工具列表、工具名到连接的映射
     """
-    all_tools = []
-    tool_to_server = {}  # tool_name -> server_config
+    # 并行连接所有服务器
+    tasks = [_connect_single_server(name) for name in servers_to_use]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    for server_name in servers_to_use:
-        server_config = get_mcp_server_by_name(server_name)
-        if not server_config:
+    connections = []
+    all_tools = []
+    tool_to_connection = {}  # tool_name -> MCPConnection
+    
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        if result is None:
             continue
         
-        command = server_config.get("command")
-        args = server_config.get("args", [])
-        env = server_config.get("env")
+        conn = result
+        connections.append(conn)
         
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env
-        )
-        
+        for tool in conn.tools:
+            all_tools.append(tool)
+            tool_to_connection[tool.name] = conn
+    
+    return connections, all_tools, tool_to_connection
+
+
+async def close_mcp_connections(connections: List[MCPConnection]) -> None:
+    """关闭所有 MCP 连接"""
+    for conn in connections:
         try:
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools_result = await session.list_tools()
-                    
-                    for tool in tools_result.tools:
-                        all_tools.append(tool)
-                        tool_to_server[tool.name] = server_config
-        except Exception as e:
-            console.print(f"[yellow]{t('error.mcp_connect_failed', name=server_name, error=str(e))}[/yellow]")
-    
-    return all_tools, tool_to_server
-
-
-async def call_tool_on_server(server_config: dict, tool_name: str, tool_args: dict) -> str:
-    """在指定服务器上调用工具"""
-    command = server_config.get("command")
-    args = server_config.get("args", [])
-    env = server_config.get("env")
-    
-    server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=env
-    )
-    
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, tool_args)
-            return str(result.content) if result.content else t("status.tool_success")
+            await conn.close()
+        except Exception:
+            pass
 
 
 async def run_with_mcp_tools(
@@ -313,8 +360,8 @@ async def run_with_mcp_tools(
     system_prompt: Optional[str] = None,
     role_name: Optional[str] = None
 ) -> str:
-    """使用 MCP 工具执行问答（ReAct 模式，支持多服务器）"""
-    if not MCP_AVAILABLE:
+    """使用 MCP 工具执行问答（ReAct 模式，支持多服务器，连接复用）"""
+    if not _lazy_import_mcp():
         raise RuntimeError(t("error.mcp_not_installed"))
     
     # 确定要使用的服务器
@@ -326,77 +373,83 @@ async def run_with_mcp_tools(
     if not servers_to_use:
         raise RuntimeError(t("error.no_mcp_servers"))
     
-    # 从所有服务器收集工具
-    all_tools, tool_to_server = await collect_tools_from_servers(servers_to_use)
+    # 并行连接所有服务器（连接复用：整个会话中保持连接）
+    connections, all_tools, tool_to_connection = await connect_mcp_servers(servers_to_use)
     
-    if not all_tools:
-        raise RuntimeError(t("error.no_mcp_tools"))
-    
-    # 转换为 OpenAI 格式
-    openai_tools = convert_mcp_tools_to_openai(all_tools)
-    
-    # 构建消息
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": question})
-    
-    # 循环执行工具调用（ReAct 模式）
-    max_iterations = 10
-    for _ in range(max_iterations):
-        # 调用 LLM
-        response = llm.invoke(
-            messages,
-            tools=openai_tools,
-            tool_choice="auto"
-        )
+    try:
+        if not all_tools:
+            raise RuntimeError(t("error.no_mcp_tools"))
         
-        # 检查是否有工具调用
-        if not response.tool_calls:
-            return response.content
+        # 转换为 OpenAI 格式
+        openai_tools = convert_mcp_tools_to_openai(all_tools)
         
-        # 添加助手消息
-        messages.append({
-            "role": "assistant",
-            "content": response.content,
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["args"])
-                    }
-                }
-                for tc in response.tool_calls
-            ]
-        })
+        # 构建消息
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": question})
         
-        # 执行工具调用
-        for tool_call in response.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+        # 循环执行工具调用（ReAct 模式）
+        max_iterations = 10
+        for _ in range(max_iterations):
+            # 调用 LLM
+            response = llm.invoke(
+                messages,
+                tools=openai_tools,
+                tool_choice="auto"
+            )
             
-            console.print(f"[dim]{t('status.tool_call', name=tool_name)}[/dim]")
+            # 检查是否有工具调用
+            if not response.tool_calls:
+                return response.content
             
-            # 找到工具对应的服务器
-            server_config = tool_to_server.get(tool_name)
-            if not server_config:
-                tool_result = t("error.tool_not_found", name=tool_name)
-            else:
-                try:
-                    tool_result = await call_tool_on_server(server_config, tool_name, tool_args)
-                except Exception as e:
-                    tool_result = t("error.tool_error", error=str(e))
-            
-            # 添加工具结果
+            # 添加助手消息
             messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": tool_result
+                "role": "assistant",
+                "content": response.content,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["args"])
+                        }
+                    }
+                    for tc in response.tool_calls
+                ]
             })
+            
+            # 执行工具调用（复用已建立的连接）
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                
+                console.print(f"[dim]{t('status.tool_call', name=tool_name)}[/dim]")
+                
+                # 找到工具对应的连接
+                conn = tool_to_connection.get(tool_name)
+                if not conn:
+                    tool_result = t("error.tool_not_found", name=tool_name)
+                else:
+                    try:
+                        result = await conn.call_tool(tool_name, tool_args)
+                        tool_result = str(result.content) if result.content else t("status.tool_success")
+                    except Exception as e:
+                        tool_result = t("error.tool_error", error=str(e))
+                
+                # 添加工具结果
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": tool_result
+                })
+        
+        return t("error.max_iterations")
     
-    return t("error.max_iterations")
+    finally:
+        # 确保关闭所有连接
+        await close_mcp_connections(connections)
 
 
 # ==================== 记忆层级配置 ====================
@@ -701,7 +754,7 @@ def ask_question(
         use_mcp = mcp_servers is not None or use_tools
         
         if use_mcp:
-            if not MCP_AVAILABLE:
+            if not _lazy_import_mcp():
                 console.print(f"[red]{t('error.mcp_not_installed')}[/red]")
                 sys.exit(1)
             
@@ -1241,7 +1294,7 @@ def mcp_list():
 @click.argument("name", required=False)
 def mcp_tools(name):
     """List MCP server tools / 列出 MCP 服务器提供的工具"""
-    if not MCP_AVAILABLE:
+    if not _lazy_import_mcp():
         console.print(f"[red]{t('error.mcp_not_installed')}[/red]")
         sys.exit(1)
     
@@ -1267,21 +1320,12 @@ def mcp_tools(name):
     server_config = servers.get(server_name)
     
     async def list_tools():
-        command = server_config.get("command")
-        args = server_config.get("args", [])
-        env = server_config.get("env")
-        
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env
-        )
-        
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                return result.tools
+        conn = MCPConnection(server_name, server_config)
+        try:
+            await conn.connect()
+            return conn.tools
+        finally:
+            await conn.close()
     
     with console.status(f"[bold green]{t('status.connecting_mcp', name=server_name)}[/bold green]"):
         try:
