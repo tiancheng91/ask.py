@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 
 import asyncio
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -733,13 +734,48 @@ def get_model(model_name: Optional[str] = None) -> ChatOpenAI:
 
 # ==================== 问答功能 ====================
 
+def get_context_info() -> str:
+    """获取当前上下文信息（工作目录、环境变量等）"""
+    context_parts = []
+    
+    # 当前工作目录
+    try:
+        cwd = os.getcwd()
+        context_parts.append(f"当前工作目录: {cwd}")
+    except Exception:
+        pass
+    
+    # 系统信息
+    import platform
+    context_parts.append(f"操作系统: {platform.system()} {platform.release()}")
+    context_parts.append(f"Python 版本: {platform.python_version()}")
+    
+    # 重要的环境变量
+    important_env = ["PATH", "HOME", "USER", "SHELL", "LANG", "EDITOR"]
+    env_info = []
+    for key in important_env:
+        value = os.environ.get(key)
+        if value:
+            # 截断过长的 PATH
+            if key == "PATH" and len(value) > 200:
+                value = value[:200] + "..."
+            env_info.append(f"{key}={value}")
+    
+    if env_info:
+        context_parts.append(f"环境变量: {', '.join(env_info)}")
+    
+    return "\n".join(context_parts)
+
+
 def ask_question(
     question: str, 
     model_name: Optional[str] = None, 
     system_prompt: Optional[str] = None,
     role_name: Optional[str] = None,
     mcp_servers: Optional[List[str]] = None,
-    use_tools: bool = False
+    use_tools: bool = False,
+    stream: bool = True,
+    stdin_input: Optional[str] = None
 ):
     """向 LLM 提问并打印回答
     
@@ -761,6 +797,18 @@ def ask_question(
         
         # 确定系统提示词
         final_system = system_prompt or role_config.get("system_prompt", "")
+        
+        # 添加上下文信息到系统提示词
+        context_info = get_context_info()
+        if context_info:
+            if final_system:
+                final_system += f"\n\n[上下文信息]\n{context_info}"
+            else:
+                final_system = f"[上下文信息]\n{context_info}"
+        
+        # 如果有 stdin 输入，添加到问题中
+        if stdin_input:
+            question = f"{question}\n\n[输入内容]\n{stdin_input}"
         
         # 确定使用的模型
         final_model = model_name or role_config.get("model") or config.get("default")
@@ -812,17 +860,54 @@ def ask_question(
         else:
             status_text = t("status.thinking")
         
-        with console.status(f"[bold green]{status_text}...[/bold green]"):
-            response = llm.invoke(messages)
-        
-        # 输出回答
-        console.print()
-        console.print(Markdown(response.content))
-        console.print()
+        # 流式输出或普通输出
+        if stream:
+            # 流式输出
+            console.print()
+            full_content = ""
+            try:
+                # 使用 Live 来实时更新输出，支持 Markdown 渲染
+                from rich.live import Live
+                from rich.markdown import Markdown as RichMarkdown
+                
+                with Live(RichMarkdown(""), refresh_per_second=10, console=console) as live:
+                    for chunk in llm.stream(messages):
+                        if hasattr(chunk, 'content') and chunk.content:
+                            content = chunk.content
+                            full_content += content
+                            # 实时更新 Markdown 渲染
+                            live.update(RichMarkdown(full_content))
+                console.print()  # 换行
+            except ImportError:
+                # 如果 rich.live 不可用，使用简单输出
+                for chunk in llm.stream(messages):
+                    if hasattr(chunk, 'content') and chunk.content:
+                        content = chunk.content
+                        full_content += content
+                        console.print(content, end="", markup=False)
+                console.print()  # 换行
+                console.print()
+            except Exception as e:
+                # 如果流式输出失败，回退到普通模式
+                console.print(f"[yellow]流式输出失败，使用普通模式: {str(e)}[/yellow]")
+                with console.status(f"[bold green]{status_text}...[/bold green]"):
+                    response = llm.invoke(messages)
+                full_content = response.content
+                console.print()
+                console.print(Markdown(full_content))
+                console.print()
+        else:
+            # 普通输出
+            with console.status(f"[bold green]{status_text}...[/bold green]"):
+                response = llm.invoke(messages)
+            full_content = response.content
+            console.print()
+            console.print(Markdown(full_content))
+            console.print()
         
         # 如果使用了角色，保存到记忆
         if active_role and active_role in roles:
-            add_to_memory(active_role, question, response.content)
+            add_to_memory(active_role, question, full_content)
             # 检查是否需要压缩记忆
             compress_memory(active_role, llm)
         
@@ -879,13 +964,16 @@ def cli():
 
 
 @cli.command("q")
-@click.argument("question", nargs=-1, required=True)
+@click.argument("question", nargs=-1, required=False)
 @click.option("-m", "--model", help="Specify model name")
 @click.option("-s", "--system", help="Set system prompt (temporary)")
 @click.option("-r", "--role", help="Use specified role")
 @click.option("-t", "--tools", is_flag=True, help="Enable MCP tools")
 @click.option("--mcp", "mcp_servers", multiple=True, help="Specify MCP server (can be used multiple times)")
-def ask_cmd(question, model, system, role, tools, mcp_servers):
+@click.option("--no-stream", is_flag=True, help="Disable streaming output")
+@click.option("-f", "--file", "file_path", help="Read question from file or analyze file content")
+@click.option("--stdin", is_flag=True, help="Read additional input from stdin (for error analysis)")
+def ask_cmd(question, model, system, role, tools, mcp_servers, no_stream, file_path, stdin):
     """Ask LLM a question / 向 LLM 提问
     
     \b
@@ -894,9 +982,57 @@ def ask_cmd(question, model, system, role, tools, mcp_servers):
       ask -r coder "Write a quicksort"
       ask -t "What time is it?"
       ask --mcp shell "List files in current directory"
+      cat error.log | ask "分析这个错误" --stdin
+      ask -f code.py "解释这个文件"
+      ask "解释这个文件" -f code.py
     """
+    # 读取 stdin 输入（如果指定，优先读取）
+    stdin_input = None
+    if stdin:
+        if not sys.stdin.isatty():
+            stdin_input = sys.stdin.read()
+            if not stdin_input.strip():
+                console.print("[yellow]警告: --stdin 已指定但 stdin 为空[/yellow]")
+        else:
+            console.print("[yellow]警告: --stdin 已指定但 stdin 为空[/yellow]")
+    
+    # 读取问题
+    if file_path:
+        # 如果指定了文件，读取文件内容
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            
+            # 如果提供了问题，将文件内容作为上下文
+            if question:
+                question_text = " ".join(question)
+                # 将文件内容添加到 stdin_input 或作为问题的一部分
+                if stdin_input:
+                    stdin_input = f"{stdin_input}\n\n[文件内容: {file_path}]\n{file_content}"
+                else:
+                    stdin_input = f"[文件内容: {file_path}]\n{file_content}"
+            else:
+                # 如果没有问题，使用默认问题
+                question_text = f"请分析这个文件的内容: {file_path}"
+                stdin_input = file_content
+        except Exception as e:
+            console.print(f"[red]无法读取文件 {file_path}: {str(e)}[/red]")
+            sys.exit(1)
+    elif question:
+        question_text = " ".join(question)
+    else:
+        # 如果没有提供问题，尝试从 stdin 读取（如果没有使用 --stdin）
+        if not stdin and not sys.stdin.isatty():
+            question_text = sys.stdin.read().strip()
+            if not question_text:
+                console.print("[yellow]未提供问题，使用 --help 查看帮助[/yellow]")
+                sys.exit(1)
+        else:
+            console.print("[yellow]未提供问题，使用 --help 查看帮助[/yellow]")
+            sys.exit(1)
+    
     servers = list(mcp_servers) if mcp_servers else None
-    ask_question(" ".join(question), model, system, role, servers, tools)
+    ask_question(question_text, model, system, role, servers, tools, stream=not no_stream, stdin_input=stdin_input)
 
 
 # ==================== 模型配置命令 ====================

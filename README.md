@@ -11,10 +11,14 @@
 ## 特性
 
 - 🚀 快速终端问答，直接 `ask "问题"` 即可
+- ⚡ 流式输出，实时显示回答（默认启用）
 - 🔧 多模型配置，支持任意 OpenAI 兼容接口
 - 🎭 角色系统，自定义 System Prompt
 - 🧠 三层记忆系统（短期/中期/长期），自动压缩淘汰
 - 🔌 MCP（Model Context Protocol）工具支持
+- 📁 文件内容分析，支持 `-f` 参数读取文件
+- 📊 错误日志分析，支持从 stdin 读取
+- 🌍 上下文感知，自动注入工作目录、环境变量等
 
 ## 快速开始
 
@@ -41,18 +45,32 @@ ask model add openai \
 ### 3. 开始使用
 
 ```bash
-# 直接提问
+# 基础问答（默认流式输出，实时显示）
 ask "什么是量子计算？"
+ask "解释 Python 的装饰器"
 
-# 使用工具模式（时间查询、Shell 命令等）
-ask -t "现在几点了？"
-ask -t "列出 /tmp 目录的文件"
-ask -t "整理 ~/Downloads 下的视频文件名"
+# 分析代码文件
+ask -f main.py "解释这个文件的功能"
+ask "优化这段代码" -f utils.py
+ask -f config.yaml "检查配置是否正确"
 
-# 创建角色（带记忆）
-ask role add coder -s "你是一个资深程序员" --set-default
-ask "写一个快速排序"
-ask "改成迭代版本"  # 自动记忆上下文
+# 分析错误和日志
+cat error.log | ask "分析这个错误" --stdin
+python script.py 2>&1 | ask "解释这个错误" --stdin
+tail -n 100 app.log | ask "找出性能问题" --stdin
+
+# 使用角色（带记忆功能）
+ask role add shell -s "你是一个系统管理员助手。当用户询问系统相关问题（如文件操作、进程管理、系统信息查询等）时，优先使用 shell 命令解决，而不是使用其他编程语言代码实现。" --set-default
+ask "列出当前目录下所有大于 100MB 的文件"
+ask "找出占用 CPU 最高的进程"  # 自动记忆上下文，无需重复说明
+
+# 使用工具模式
+ask -t "现在几点了？"  # 使用 time 工具
+ask --mcp shell "列出当前目录的 Python 文件"  # 使用 shell 工具
+
+# 组合使用
+ask -r shell -f script.sh "优化这个脚本"
+ask -f main.py "添加错误处理" --no-stream  # 禁用流式输出
 ```
 
 ## 命令参考
@@ -68,6 +86,62 @@ ask [OPTIONS] "问题"
   -r, --role TEXT    使用指定角色
   -t, --tools        启用 MCP 工具
   --mcp NAME         指定 MCP 服务器（可多次使用）
+  --no-stream        禁用流式输出（一次性显示完整结果）
+  -f, --file TEXT    读取文件内容并分析
+  --stdin            从标准输入读取内容（用于错误分析等）
+```
+
+### 使用示例
+
+#### 日常问答
+```bash
+# 快速提问（流式输出，实时显示）
+ask "什么是 Python 的生成器？"
+ask "解释 RESTful API 设计原则"
+```
+
+#### 代码分析
+```bash
+# 分析单个文件
+ask -f main.py "解释这个文件的功能"
+ask "优化这段代码的性能" -f utils.py
+
+# 分析配置文件
+ask -f docker-compose.yml "检查配置是否正确"
+ask -f package.json "解释依赖关系"
+```
+
+#### 错误诊断
+```bash
+# 分析错误日志
+cat error.log | ask "分析这个错误" --stdin
+python script.py 2>&1 | ask "解释这个错误" --stdin
+
+# 分析应用日志
+tail -n 100 app.log | ask "找出性能瓶颈" --stdin
+journalctl -u myapp -n 50 | ask "分析服务问题" --stdin
+```
+
+#### 系统管理辅助
+```bash
+# 使用 shell 角色进行系统管理对话
+ask role add shell -s "你是一个系统管理员助手。当用户询问系统相关问题（如文件操作、进程管理、系统信息查询等）时，优先使用 shell 命令解决，而不是使用其他编程语言代码实现。" --set-default
+ask "找出占用磁盘空间最大的目录"
+ask "列出所有正在监听的端口"  # 自动记忆上下文
+
+# 系统问题诊断
+ask -r shell "清理 /tmp 目录下超过 7 天的文件"
+ask -r shell "检查系统负载并找出原因"
+```
+
+#### 工具集成
+```bash
+# 使用 MCP 工具
+ask -t "现在几点了？"  # 查询时间
+ask --mcp shell "列出当前目录的 Python 文件"
+
+# 组合使用
+ask -f requirements.txt "检查依赖冲突" --no-stream | tee analysis.txt
 ```
 
 ### 模型管理
@@ -108,7 +182,7 @@ ask role clear-memory NAME --confirm
 
 ```yaml
 default: openai
-default_role: coder
+default_role: shell
 lang: zh-cn  # 语言设置: en, zh-cn, zh-tw (默认根据系统 $LANG 自动检测)
 models:
   openai:
@@ -130,6 +204,72 @@ models:
 1. 配置文件中的 `lang` 设置
 2. 环境变量 `$LANG`
 3. 默认使用英文
+
+## 核心功能
+
+### 流式输出
+
+默认启用流式输出，实时显示回答内容，提升响应感知：
+
+```bash
+ask "解释量子计算原理"  # 实时显示，无需等待完整响应
+ask "详细说明" --no-stream  # 禁用流式，一次性显示完整结果
+```
+
+### 上下文感知
+
+自动注入当前环境信息，让回答更贴合实际场景：
+
+- 当前工作目录
+- 操作系统和 Python 版本
+- 重要环境变量（PATH, HOME, USER, SHELL, LANG 等）
+
+无需手动配置，系统自动识别并添加到上下文中。
+
+### 文件内容分析
+
+直接分析代码文件、配置文件等，支持多种文件格式：
+
+```bash
+# 分析代码文件
+ask -f main.py "解释这个文件的功能"
+ask "优化这段代码的性能" -f utils.py
+ask -f app.js "找出潜在的 bug"
+
+# 分析配置文件
+ask -f config.yaml "检查配置是否正确"
+ask -f docker-compose.yml "解释服务配置"
+ask -f package.json "分析依赖关系"
+
+# 分析日志文件
+ask -f access.log "分析访问模式"
+ask -f error.log "找出常见错误"
+```
+
+文件内容会自动添加到问题上下文中，LLM 可以基于实际代码进行分析。
+
+### 错误日志分析
+
+从标准输入读取错误信息进行分析，非常适合调试场景：
+
+```bash
+# 分析错误日志文件
+cat error.log | ask "分析这个错误" --stdin
+tail -n 100 app.log | ask "找出问题原因" --stdin
+
+# 分析命令输出
+python script.py 2>&1 | ask "解释这个错误" --stdin
+npm run build 2>&1 | ask "分析构建失败原因" --stdin
+
+# 分析系统日志
+journalctl -u myapp -n 50 | ask "分析服务问题" --stdin
+dmesg | tail -n 20 | ask "解释这些内核消息" --stdin
+
+# 分析测试输出
+pytest -v 2>&1 | ask "分析测试失败原因" --stdin
+```
+
+结合上下文感知功能，LLM 可以基于当前环境信息提供更准确的诊断。
 
 ## 记忆系统
 
@@ -162,17 +302,19 @@ MCP（Model Context Protocol）让 LLM 能够调用外部工具。
       "command": "uvx",
       "args": ["mcp-shell-server"],
       "env": {
-        "ALLOW_COMMANDS": "ls,cat,head,tail,find,grep,wc,pwd,echo,mkdir,cp,mv,touch,date"
+        "ALLOW_COMMANDS": "ls,cat,head,tail,find,grep,wc,pwd,echo,mkdir,cp,mv,touch,date,whoami,hostname,ps,du"
       }
     }
   },
-  "enabled": ["time", "shell"]
+  "enabled": ["time"]
 }
 ```
 
-- `time`: 查询时间
-- `shell`: 执行系统命令（通过 `ALLOW_COMMANDS` 限制可用命令）
+- `time`: 查询时间（默认启用）
+- `shell`: 执行系统命令（通过 `ALLOW_COMMANDS` 限制可用命令，默认不启用）
 - 自动检测：优先使用 `uvx`，不存在则使用 `pipx`
+
+> ⚠️ **注意**: `shell` 服务器由于执行准确性问题，默认不启用。如需使用，请通过 `--mcp shell` 手动指定，或编辑配置文件在 `enabled` 中添加 `"shell"`。
 
 ### 添加更多服务器
 
@@ -194,18 +336,20 @@ MCP（Model Context Protocol）让 LLM 能够调用外部工具。
 ```bash
 ask mcp list              # 查看服务器
 ask mcp tools shell       # 查看 shell 工具详情
-ask -t "现在几点？"        # 使用默认启用的工具（time + shell）
-ask -t "列出 /tmp 目录文件"          # LLM 自动调用 shell
-ask -t "整理 ~/Videos 下的视频文件名" # LLM 自动规划并执行命令
+ask -t "现在几点？"        # 使用默认启用的工具（time）
+ask -t "列出 /tmp 目录文件"          # 需要手动启用 shell 服务器
+ask --mcp shell "列出当前目录文件"  # 手动指定使用 shell 服务器
 ```
+
+> ⚠️ **注意**: `shell` 服务器由于执行准确性问题，默认不启用。如需使用，请通过 `--mcp shell` 手动指定，或编辑配置文件启用。
 
 ### 角色级 MCP
 
 ```yaml
 # ~/.config/ask/roles.yaml
-coder:
-  system_prompt: "你是一个程序员"
-  mcp: ["github"]  # 额外启用的服务器
+shell:
+  system_prompt: "你是一个系统管理员助手。当用户询问系统相关问题（如文件操作、进程管理、系统信息查询等）时，优先使用 shell 命令解决，而不是使用其他编程语言代码实现。"
+  mcp: ["shell"]  # 启用 shell 服务器以执行命令
 ```
 
 ## 支持的模型
