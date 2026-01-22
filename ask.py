@@ -30,6 +30,9 @@ from rich.table import Table
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
+# i18n
+from i18n import t, set_lang, get_lang, SUPPORTED_LANGS
+
 # 配置文件路径
 CONFIG_DIR = Path.home() / ".config" / "ask"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
@@ -50,15 +53,46 @@ except ImportError:
 
 # ==================== MCP 管理 ====================
 
-DEFAULT_MCP_CONFIG = {
-    "mcpServers": {
-        "time": {
-            "command": "uvx",
-            "args": ["mcp-server-time"]
-        }
-    },
-    "enabled": ["time"]
-}
+import shutil
+
+def detect_package_runner() -> str:
+    """检测可用的包运行器（uvx 或 pipx）
+    
+    Returns:
+        "uvx" 或 "pipx"，优先使用 uvx
+    """
+    if shutil.which("uvx"):
+        return "uvx"
+    elif shutil.which("pipx"):
+        return "pipx"
+    else:
+        # 默认返回 uvx，让用户自行安装
+        return "uvx"
+
+
+def get_default_mcp_config() -> dict:
+    """生成默认 MCP 配置，根据系统环境选择 uvx 或 pipx
+    
+    Returns:
+        默认 MCP 配置字典
+    """
+    runner = detect_package_runner()
+    return {
+        "mcpServers": {
+            "time": {
+                "command": runner,
+                "args": ["mcp-server-time"]
+            },
+            "shell": {
+                "command": runner,
+                "args": ["mcp-shell-server"],
+                "env": {
+                    "ALLOW_COMMANDS": "ls,cat,head,tail,find,grep,wc,pwd,echo,mkdir,cp,mv,touch,date,whoami,hostname,ps,du"
+                }
+            }
+        },
+        "enabled": ["time", "shell"]
+    }
 
 
 def load_mcp_config() -> dict:
@@ -91,9 +125,10 @@ def load_mcp_config() -> dict:
     - enabled: 全局启用的服务器列表（可选，不设置则全部启用）
     """
     if not MCP_FILE.exists():
-        # 首次使用时创建默认配置
-        save_mcp_config(DEFAULT_MCP_CONFIG)
-        return DEFAULT_MCP_CONFIG.copy()
+        # 首次使用时创建默认配置（自动检测 uvx/pipx）
+        default_config = get_default_mcp_config()
+        save_mcp_config(default_config)
+        return default_config.copy()
     
     with open(MCP_FILE, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -213,33 +248,47 @@ def convert_mcp_tools_to_openai(tools: list) -> list:
     return openai_tools
 
 
-async def run_with_mcp_tools(
-    question: str,
-    llm: ChatOpenAI,
-    server_names: Optional[List[str]] = None,
-    system_prompt: Optional[str] = None,
-    role_name: Optional[str] = None
-) -> str:
-    """使用 MCP 工具执行问答（ReAct 模式）"""
-    if not MCP_AVAILABLE:
-        raise RuntimeError("MCP 支持未安装，请运行: uv sync")
+async def collect_tools_from_servers(servers_to_use: List[str]) -> tuple:
+    """从多个 MCP 服务器收集工具
     
-    # 确定要使用的服务器
-    if server_names:
-        servers_to_use = server_names
-    else:
-        servers_to_use = get_available_mcp_servers(role_name)
+    Returns:
+        (all_tools, tool_to_server): 所有工具列表和工具名到服务器配置的映射
+    """
+    all_tools = []
+    tool_to_server = {}  # tool_name -> server_config
     
-    if not servers_to_use:
-        raise RuntimeError("没有可用的 MCP 服务器，请配置 ~/.config/ask/mcp.json")
+    for server_name in servers_to_use:
+        server_config = get_mcp_server_by_name(server_name)
+        if not server_config:
+            continue
+        
+        command = server_config.get("command")
+        args = server_config.get("args", [])
+        env = server_config.get("env")
+        
+        server_params = StdioServerParameters(
+            command=command,
+            args=args,
+            env=env
+        )
+        
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools_result = await session.list_tools()
+                    
+                    for tool in tools_result.tools:
+                        all_tools.append(tool)
+                        tool_to_server[tool.name] = server_config
+        except Exception as e:
+            console.print(f"[yellow]{t('error.mcp_connect_failed', name=server_name, error=str(e))}[/yellow]")
     
-    # 目前只支持单个服务器
-    server_name = servers_to_use[0]
-    server_config = get_mcp_server_by_name(server_name)
-    
-    if not server_config:
-        raise RuntimeError(f"MCP 服务器 '{server_name}' 不存在")
-    
+    return all_tools, tool_to_server
+
+
+async def call_tool_on_server(server_config: dict, tool_name: str, tool_args: dict) -> str:
+    """在指定服务器上调用工具"""
     command = server_config.get("command")
     args = server_config.get("args", [])
     env = server_config.get("env")
@@ -253,75 +302,101 @@ async def run_with_mcp_tools(
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            result = await session.call_tool(tool_name, tool_args)
+            return str(result.content) if result.content else t("status.tool_success")
+
+
+async def run_with_mcp_tools(
+    question: str,
+    llm: ChatOpenAI,
+    server_names: Optional[List[str]] = None,
+    system_prompt: Optional[str] = None,
+    role_name: Optional[str] = None
+) -> str:
+    """使用 MCP 工具执行问答（ReAct 模式，支持多服务器）"""
+    if not MCP_AVAILABLE:
+        raise RuntimeError(t("error.mcp_not_installed"))
+    
+    # 确定要使用的服务器
+    if server_names:
+        servers_to_use = server_names
+    else:
+        servers_to_use = get_available_mcp_servers(role_name)
+    
+    if not servers_to_use:
+        raise RuntimeError(t("error.no_mcp_servers"))
+    
+    # 从所有服务器收集工具
+    all_tools, tool_to_server = await collect_tools_from_servers(servers_to_use)
+    
+    if not all_tools:
+        raise RuntimeError(t("error.no_mcp_tools"))
+    
+    # 转换为 OpenAI 格式
+    openai_tools = convert_mcp_tools_to_openai(all_tools)
+    
+    # 构建消息
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": question})
+    
+    # 循环执行工具调用（ReAct 模式）
+    max_iterations = 10
+    for _ in range(max_iterations):
+        # 调用 LLM
+        response = llm.invoke(
+            messages,
+            tools=openai_tools,
+            tool_choice="auto"
+        )
+        
+        # 检查是否有工具调用
+        if not response.tool_calls:
+            return response.content
+        
+        # 添加助手消息
+        messages.append({
+            "role": "assistant",
+            "content": response.content,
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["args"])
+                    }
+                }
+                for tc in response.tool_calls
+            ]
+        })
+        
+        # 执行工具调用
+        for tool_call in response.tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
             
-            # 获取工具列表
-            tools_result = await session.list_tools()
-            mcp_tools = tools_result.tools
+            console.print(f"[dim]{t('status.tool_call', name=tool_name)}[/dim]")
             
-            if not mcp_tools:
-                raise RuntimeError("MCP 服务器没有提供任何工具")
+            # 找到工具对应的服务器
+            server_config = tool_to_server.get(tool_name)
+            if not server_config:
+                tool_result = t("error.tool_not_found", name=tool_name)
+            else:
+                try:
+                    tool_result = await call_tool_on_server(server_config, tool_name, tool_args)
+                except Exception as e:
+                    tool_result = t("error.tool_error", error=str(e))
             
-            # 转换为 OpenAI 格式
-            openai_tools = convert_mcp_tools_to_openai(mcp_tools)
-            
-            # 构建消息
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": question})
-            
-            # 循环执行工具调用（ReAct 模式）
-            max_iterations = 10
-            for _ in range(max_iterations):
-                # 调用 LLM
-                response = llm.invoke(
-                    messages,
-                    tools=openai_tools,
-                    tool_choice="auto"
-                )
-                
-                # 检查是否有工具调用
-                if not response.tool_calls:
-                    return response.content
-                
-                # 添加助手消息
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": json.dumps(tc["args"])
-                            }
-                        }
-                        for tc in response.tool_calls
-                    ]
-                })
-                
-                # 执行工具调用
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call["name"]
-                    tool_args = tool_call["args"]
-                    
-                    console.print(f"[dim]调用工具: {tool_name}[/dim]")
-                    
-                    try:
-                        result = await session.call_tool(tool_name, tool_args)
-                        tool_result = str(result.content) if result.content else "执行成功"
-                    except Exception as e:
-                        tool_result = f"工具执行错误: {e}"
-                    
-                    # 添加工具结果
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": tool_result
-                    })
-            
-            return "达到最大迭代次数，请简化问题"
+            # 添加工具结果
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": tool_result
+            })
+    
+    return t("error.max_iterations")
 
 
 # ==================== 记忆层级配置 ====================
@@ -331,24 +406,24 @@ MEMORY_CONFIG = {
     "compress_threshold": 10, # 触发压缩的对话轮数
 }
 
-COMPRESS_PROMPT = """请将以下对话历史压缩成简洁的摘要，保留关键信息和上下文要点。
-摘要应该包含：
-1. 讨论的主要话题
-2. 重要的结论或决定
-3. 用户的关键偏好或需求
+COMPRESS_PROMPT = """Please compress the following conversation history into a concise summary, keeping key information and context.
+Summary should include:
+1. Main topics discussed
+2. Important conclusions or decisions
+3. User's key preferences or needs
 
-对话历史：
+Conversation history:
 {conversations}
 
-请用2-3句话输出摘要："""
+Please output summary in 2-3 sentences:"""
 
-MERGE_SUMMARIES_PROMPT = """请将以下多个对话摘要合并成一个更精炼的长期记忆摘要。
-保留最重要的信息和模式。
+MERGE_SUMMARIES_PROMPT = """Please merge the following summaries into a more refined long-term memory summary.
+Keep the most important information and patterns.
 
-摘要列表：
+Summary list:
 {summaries}
 
-请输出合并后的精炼摘要（1-2句话）："""
+Please output merged refined summary (1-2 sentences):"""
 
 
 # ==================== 配置管理 ====================
@@ -356,15 +431,21 @@ MERGE_SUMMARIES_PROMPT = """请将以下多个对话摘要合并成一个更精�
 def load_config() -> dict:
     """加载模型配置文件"""
     if not CONFIG_FILE.exists():
-        return {"models": {}, "default": None, "default_role": None}
+        return {"models": {}, "default": None, "default_role": None, "lang": None}
     
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
+    
+    # 设置语言
+    lang = config.get("lang")
+    if lang and lang in SUPPORTED_LANGS:
+        set_lang(lang)
     
     return {
         "models": config.get("models", {}),
         "default": config.get("default"),
         "default_role": config.get("default_role"),
+        "lang": lang,
     }
 
 
@@ -459,7 +540,7 @@ def compress_memory(role_name: str, llm: ChatOpenAI) -> None:
     if turns < MEMORY_CONFIG["compress_threshold"]:
         return
     
-    console.print("[dim]正在压缩记忆...[/dim]")
+    console.print(f"[dim]{t('status.compressing')}[/dim]")
     
     # 取出需要压缩的对话（保留最近的一半）
     keep_count = MEMORY_CONFIG["recent_limit"] * 2  # 保留的消息数
@@ -470,7 +551,7 @@ def compress_memory(role_name: str, llm: ChatOpenAI) -> None:
     
     # 格式化对话历史
     conv_text = "\n".join([
-        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
         for m in to_compress
     ])
     
@@ -495,10 +576,10 @@ def compress_memory(role_name: str, llm: ChatOpenAI) -> None:
             merge_to_long_memory(memory, llm)
         
         save_memory(role_name, memory)
-        console.print("[dim]记忆压缩完成[/dim]")
+        console.print(f"[dim]{t('status.compressed')}[/dim]")
         
     except Exception as e:
-        console.print(f"[yellow]记忆压缩失败: {e}[/yellow]")
+        console.print(f"[yellow]{t('error.general', error=str(e))}[/yellow]")
 
 
 def merge_to_long_memory(memory: dict, llm: ChatOpenAI) -> None:
@@ -507,7 +588,7 @@ def merge_to_long_memory(memory: dict, llm: ChatOpenAI) -> None:
     
     # 包含现有的长期记忆
     if memory["long"]:
-        summaries.insert(0, f"历史背景: {memory['long']}")
+        summaries.insert(0, f"Historical background: {memory['long']}")
     
     summaries_text = "\n".join([f"- {s}" for s in summaries])
     
@@ -520,7 +601,7 @@ def merge_to_long_memory(memory: dict, llm: ChatOpenAI) -> None:
         memory["medium"] = memory["medium"][-1:]
         
     except Exception as e:
-        console.print(f"[yellow]长期记忆合并失败: {e}[/yellow]")
+        console.print(f"[yellow]{t('error.general', error=str(e))}[/yellow]")
 
 
 def build_context_messages(role_name: str, system_prompt: str) -> List:
@@ -559,7 +640,7 @@ def get_model(model_name: Optional[str] = None) -> ChatOpenAI:
     config = load_config()
     
     if not config["models"]:
-        console.print("[red]错误: 尚未配置任何模型，请先运行 'ask config add' 添加模型[/red]")
+        console.print(f"[red]{t('error.no_model_config')}[/red]")
         sys.exit(1)
     
     name = model_name or config.get("default")
@@ -567,7 +648,7 @@ def get_model(model_name: Optional[str] = None) -> ChatOpenAI:
         name = list(config["models"].keys())[0]
     
     if name not in config["models"]:
-        console.print(f"[red]错误: 模型 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.model_not_found', name=name)}[/red]")
         sys.exit(1)
     
     model_config = config["models"][name]
@@ -621,11 +702,11 @@ def ask_question(
         
         if use_mcp:
             if not MCP_AVAILABLE:
-                console.print("[red]错误: MCP 支持未安装，请运行: uv sync[/red]")
+                console.print(f"[red]{t('error.mcp_not_installed')}[/red]")
                 sys.exit(1)
             
             # 显示状态
-            status_text = f"正在思考 (模型: {final_model}, 工具模式)"
+            status_text = t("status.thinking_tools", model=final_model)
             
             with console.status(f"[bold green]{status_text}...[/bold green]"):
                 response_content = asyncio.run(
@@ -654,12 +735,12 @@ def ask_question(
         messages.append(HumanMessage(content=question))
         
         # 显示状态
-        status_text = f"正在思考"
-        if final_model:
-            status_text += f" (模型: {final_model}"
-            if active_role:
-                status_text += f", 角色: {active_role}"
-            status_text += ")"
+        if final_model and active_role:
+            status_text = t("status.thinking_with_role", model=final_model, role=active_role)
+        elif final_model:
+            status_text = t("status.thinking_with_model", model=final_model)
+        else:
+            status_text = t("status.thinking")
         
         with console.status(f"[bold green]{status_text}...[/bold green]"):
             response = llm.invoke(messages)
@@ -676,13 +757,13 @@ def ask_question(
             compress_memory(active_role, llm)
         
     except Exception as e:
-        console.print(f"[red]错误: {e}[/red]")
+        console.print(f"[red]{t('error.general', error=str(e))}[/red]")
         sys.exit(1)
 
 
 # ==================== CLI 命令 ====================
 
-SUBCOMMANDS = ["config", "role", "mcp", "q"]
+SUBCOMMANDS = ["model", "role", "mcp", "q"]
 
 
 class AskCLI(click.Group):
@@ -712,35 +793,37 @@ class AskCLI(click.Group):
 
 @click.group(cls=AskCLI)
 def cli():
-    """ask.py - 终端 LLM 问答工具
+    """ask.py - Terminal LLM Q&A Tool / 终端 LLM 问答工具
     
     \b
-    直接提问: ask "你的问题"
-    使用角色: ask -r coder "帮我写代码"
-    使用工具: ask -t "帮我查询天气"
-    配置模型: ask config --help
-    管理角色: ask role --help
-    管理工具: ask mcp --help
+    Quick ask / 快速提问: ask "your question"
+    Use role / 使用角色: ask -r coder "help me code"
+    Use tools / 使用工具: ask -t "check the weather"
+    Use shell / 使用 Shell: ask --mcp shell "list files"
+    Manage models / 管理模型: ask model --help
+    Manage roles / 管理角色: ask role --help
+    Manage tools / 管理工具: ask mcp --help
     """
-    pass
+    # 初始化时加载配置以设置语言
+    load_config()
 
 
 @cli.command("q")
 @click.argument("question", nargs=-1, required=True)
-@click.option("-m", "--model", help="指定使用的模型名称")
-@click.option("-s", "--system", help="设置系统提示词（临时）")
-@click.option("-r", "--role", help="使用指定角色")
-@click.option("-t", "--tools", is_flag=True, help="启用 MCP 工具（使用默认启用的服务器）")
-@click.option("--mcp", "mcp_servers", multiple=True, help="指定 MCP 服务器（可多次使用）")
+@click.option("-m", "--model", help="Specify model name")
+@click.option("-s", "--system", help="Set system prompt (temporary)")
+@click.option("-r", "--role", help="Use specified role")
+@click.option("-t", "--tools", is_flag=True, help="Enable MCP tools")
+@click.option("--mcp", "mcp_servers", multiple=True, help="Specify MCP server (can be used multiple times)")
 def ask_cmd(question, model, system, role, tools, mcp_servers):
-    """向 LLM 提问
+    """Ask LLM a question / 向 LLM 提问
     
     \b
-    示例:
-      ask "什么是机器学习?"
-      ask -r coder "写一个快速排序"
-      ask -t "帮我读取当前目录的文件"
-      ask --mcp filesystem "列出 /tmp 目录"
+    Examples / 示例:
+      ask "What is machine learning?"
+      ask -r coder "Write a quicksort"
+      ask -t "What time is it?"
+      ask --mcp shell "List files in current directory"
     """
     servers = list(mcp_servers) if mcp_servers else None
     ask_question(" ".join(question), model, system, role, servers, tools)
@@ -748,21 +831,21 @@ def ask_cmd(question, model, system, role, tools, mcp_servers):
 
 # ==================== 模型配置命令 ====================
 
-@cli.group("config")
-def config_group():
-    """配置模型"""
+@cli.group("model")
+def model_group():
+    """管理模型"""
     pass
 
 
-@config_group.command("add")
+@model_group.command("add")
 @click.argument("name")
-@click.option("--api-base", "-b", required=True, help="API 基础 URL")
+@click.option("--api-base", "-b", required=True, help="API base URL")
 @click.option("--api-key", "-k", required=True, help="API Key")
-@click.option("--model", "-m", default="gpt-3.5-turbo", help="模型名称")
-@click.option("--temperature", "-t", default=0.7, type=float, help="温度参数")
-@click.option("--set-default", is_flag=True, help="设置为默认模型")
+@click.option("--model", "-m", default="gpt-3.5-turbo", help="Model name")
+@click.option("--temperature", "-t", default=0.7, type=float, help="Temperature")
+@click.option("--set-default", is_flag=True, help="Set as default")
 def config_add(name, api_base, api_key, model, temperature, set_default):
-    """添加模型配置"""
+    """Add model configuration / 添加模型配置"""
     cfg = load_config()
     
     cfg["models"][name] = {
@@ -776,19 +859,19 @@ def config_add(name, api_base, api_key, model, temperature, set_default):
         cfg["default"] = name
     
     save_config(cfg)
-    console.print(f"[green]✓ 模型 '{name}' 已添加[/green]")
+    console.print(f"[green]✓ {t('success.model_added', name=name)}[/green]")
     if cfg["default"] == name:
-        console.print(f"[blue]  已设为默认模型[/blue]")
+        console.print(f"[blue]  {t('success.set_as_default')}[/blue]")
 
 
-@config_group.command("remove")
+@model_group.command("remove")
 @click.argument("name")
 def config_remove(name):
-    """删除模型配置"""
+    """Remove model configuration / 删除模型配置"""
     cfg = load_config()
     
     if name not in cfg["models"]:
-        console.print(f"[red]错误: 模型 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.model_not_found', name=name)}[/red]")
         sys.exit(1)
     
     del cfg["models"][name]
@@ -796,38 +879,38 @@ def config_remove(name):
         cfg["default"] = list(cfg["models"].keys())[0] if cfg["models"] else None
     
     save_config(cfg)
-    console.print(f"[green]✓ 模型 '{name}' 已删除[/green]")
+    console.print(f"[green]✓ {t('success.model_removed', name=name)}[/green]")
 
 
-@config_group.command("default")
+@model_group.command("default")
 @click.argument("name")
 def config_default(name):
-    """设置默认模型"""
+    """Set default model / 设置默认模型"""
     cfg = load_config()
     
     if name not in cfg["models"]:
-        console.print(f"[red]错误: 模型 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.model_not_found', name=name)}[/red]")
         sys.exit(1)
     
     cfg["default"] = name
     save_config(cfg)
-    console.print(f"[green]✓ 默认模型已设置为 '{name}'[/green]")
+    console.print(f"[green]✓ {t('success.model_default', name=name)}[/green]")
 
 
-@config_group.command("list")
+@model_group.command("list")
 def config_list():
-    """列出所有模型配置"""
+    """List all model configurations / 列出所有模型配置"""
     cfg = load_config()
     
     if not cfg["models"]:
-        console.print("[yellow]尚未配置任何模型[/yellow]")
+        console.print(f"[yellow]{t('hint.no_model')}[/yellow]")
         return
     
-    table = Table(title="模型配置列表")
-    table.add_column("名称", style="cyan")
-    table.add_column("API Base", style="green")
-    table.add_column("模型", style="yellow")
-    table.add_column("默认", justify="center")
+    table = Table(title=t("table.model_list"))
+    table.add_column(t("table.col.name"), style="cyan")
+    table.add_column(t("table.col.api_base"), style="green")
+    table.add_column(t("table.col.model"), style="yellow")
+    table.add_column(t("table.col.default"), justify="center")
     
     for name, model in cfg["models"].items():
         is_default = "✓" if name == cfg.get("default") else ""
@@ -846,23 +929,17 @@ def role_group():
 
 @role_group.command("add")
 @click.argument("name")
-@click.option("-s", "--system", required=True, help="系统提示词")
-@click.option("-m", "--model", help="绑定的模型（可选）")
-@click.option("--set-default", is_flag=True, help="设置为默认角色")
+@click.option("-s", "--system", required=True, help="System prompt")
+@click.option("-m", "--model", help="Bind model (optional)")
+@click.option("--set-default", is_flag=True, help="Set as default")
 def role_add(name, system, model, set_default):
-    """添加新角色
-    
-    \b
-    示例:
-      ask role add coder -s "你是一个资深程序员，擅长写简洁高效的代码"
-      ask role add translator -s "你是专业翻译，精通中英文互译" --set-default
-    """
+    """Add new role / 添加新角色"""
     roles = load_roles()
     cfg = load_config()
     
     # 如果指定了模型，检查模型是否存在
     if model and model not in cfg["models"]:
-        console.print(f"[red]错误: 模型 '{model}' 不存在[/red]")
+        console.print(f"[red]{t('error.model_not_found', name=model)}[/red]")
         sys.exit(1)
     
     roles[name] = {
@@ -877,21 +954,21 @@ def role_add(name, system, model, set_default):
         cfg["default_role"] = name
         save_config(cfg)
     
-    console.print(f"[green]✓ 角色 '{name}' 已创建[/green]")
+    console.print(f"[green]✓ {t('success.role_created', name=name)}[/green]")
     if set_default:
-        console.print(f"[blue]  已设为默认角色[/blue]")
+        console.print(f"[blue]  {t('hint.set_as_default_role')}[/blue]")
 
 
 @role_group.command("remove")
 @click.argument("name")
-@click.option("--keep-memory", is_flag=True, help="保留记忆数据")
+@click.option("--keep-memory", is_flag=True, help="Keep memory data")
 def role_remove(name, keep_memory):
-    """删除角色"""
+    """Remove role / 删除角色"""
     roles = load_roles()
     cfg = load_config()
     
     if name not in roles:
-        console.print(f"[red]错误: 角色 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.role_not_found', name=name)}[/red]")
         sys.exit(1)
     
     del roles[name]
@@ -902,32 +979,32 @@ def role_remove(name, keep_memory):
         memory_file = get_memory_file(name)
         if memory_file.exists():
             memory_file.unlink()
-            console.print(f"[dim]记忆数据已删除[/dim]")
+            console.print(f"[dim]{t('success.memory_deleted')}[/dim]")
     
     if cfg.get("default_role") == name:
         cfg["default_role"] = None
         save_config(cfg)
     
-    console.print(f"[green]✓ 角色 '{name}' 已删除[/green]")
+    console.print(f"[green]✓ {t('success.role_removed', name=name)}[/green]")
 
 
 @role_group.command("list")
 def role_list():
-    """列出所有角色"""
+    """List all roles / 列出所有角色"""
     roles = load_roles()
     cfg = load_config()
     
     if not roles:
-        console.print("[yellow]尚未创建任何角色[/yellow]")
-        console.print("使用 'ask role add' 创建角色")
+        console.print(f"[yellow]{t('hint.no_role')}[/yellow]")
+        console.print(t('hint.create_role'))
         return
     
-    table = Table(title="角色列表")
-    table.add_column("名称", style="cyan")
-    table.add_column("系统提示词", style="green", max_width=40)
-    table.add_column("绑定模型", style="yellow")
-    table.add_column("记忆轮数", justify="right")
-    table.add_column("默认", justify="center")
+    table = Table(title=t("table.role_list"))
+    table.add_column(t("table.col.name"), style="cyan")
+    table.add_column(t("table.col.system_prompt"), style="green", max_width=40)
+    table.add_column(t("table.col.bind_model"), style="yellow")
+    table.add_column(t("table.col.memory_turns"), justify="right")
+    table.add_column(t("table.col.default"), justify="center")
     
     for name, role in roles.items():
         is_default = "✓" if name == cfg.get("default_role") else ""
@@ -953,12 +1030,12 @@ def role_list():
 @role_group.command("show")
 @click.argument("name")
 def role_show(name):
-    """显示角色详情"""
+    """Show role details / 显示角色详情"""
     roles = load_roles()
     cfg = load_config()
     
     if name not in roles:
-        console.print(f"[red]错误: 角色 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.role_not_found', name=name)}[/red]")
         sys.exit(1)
     
     role = roles[name]
@@ -970,135 +1047,135 @@ def role_show(name):
     medium_count = len(memory["medium"])
     has_long = bool(memory["long"])
     
-    panel_content = f"""[cyan]名称:[/cyan] {name}
-[cyan]系统提示词:[/cyan]
+    panel_content = f"""[cyan]{t('detail.name')}[/cyan] {name}
+[cyan]{t('detail.system_prompt')}[/cyan]
 {role.get('system_prompt', '')}
 
-[cyan]绑定模型:[/cyan] {role.get('model', '无')}
-[cyan]默认角色:[/cyan] {'是' if is_default else '否'}
-[cyan]创建时间:[/cyan] {role.get('created_at', '未知')}
+[cyan]{t('detail.bind_model')}[/cyan] {role.get('model') or t('detail.none')}
+[cyan]{t('detail.is_default')}[/cyan] {t('detail.yes') if is_default else t('detail.no')}
+[cyan]{t('detail.created_at')}[/cyan] {role.get('created_at', t('detail.unknown'))}
 
-[cyan]记忆状态:[/cyan]
-  短期记忆: {recent_turns} 轮对话
-  中期记忆: {medium_count} 条摘要
-  长期记忆: {'有' if has_long else '无'}"""
+[cyan]{t('detail.memory_status')}[/cyan]
+  {t('detail.recent_turns', count=recent_turns)}
+  {t('detail.medium_count', count=medium_count)}
+  {t('detail.long_status')} {t('detail.has') if has_long else t('detail.no_data')}"""
     
-    console.print(Panel(panel_content, title=f"角色详情: {name}"))
+    console.print(Panel(panel_content, title=t("panel.role_detail", name=name)))
 
 
 @role_group.command("default")
 @click.argument("name", required=False)
 def role_default(name):
-    """设置或清除默认角色"""
+    """Set or clear default role / 设置或清除默认角色"""
     cfg = load_config()
     
     if name is None:
         # 清除默认角色
         cfg["default_role"] = None
         save_config(cfg)
-        console.print("[green]✓ 已清除默认角色[/green]")
+        console.print(f"[green]✓ {t('success.role_default_cleared')}[/green]")
         return
     
     roles = load_roles()
     if name not in roles:
-        console.print(f"[red]错误: 角色 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.role_not_found', name=name)}[/red]")
         sys.exit(1)
     
     cfg["default_role"] = name
     save_config(cfg)
-    console.print(f"[green]✓ 默认角色已设置为 '{name}'[/green]")
+    console.print(f"[green]✓ {t('success.role_default_set', name=name)}[/green]")
 
 
 @role_group.command("clear-memory")
 @click.argument("name")
-@click.option("--confirm", is_flag=True, help="确认清除")
+@click.option("--confirm", is_flag=True, help="Confirm operation")
 def role_clear_memory(name, confirm):
-    """清除角色的记忆"""
+    """Clear role memory / 清除角色记忆"""
     roles = load_roles()
     
     if name not in roles:
-        console.print(f"[red]错误: 角色 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.role_not_found', name=name)}[/red]")
         sys.exit(1)
     
     if not confirm:
-        console.print(f"[yellow]将清除角色 '{name}' 的所有记忆数据[/yellow]")
-        console.print("添加 --confirm 参数确认操作")
+        console.print(f"[yellow]{t('hint.confirm_clear', name=name)}[/yellow]")
+        console.print(t('hint.add_confirm'))
         return
     
     memory_file = get_memory_file(name)
     if memory_file.exists():
         memory_file.unlink()
     
-    console.print(f"[green]✓ 角色 '{name}' 的记忆已清除[/green]")
+    console.print(f"[green]✓ {t('success.memory_cleared', name=name)}[/green]")
 
 
 @role_group.command("memory")
 @click.argument("name")
-@click.option("--level", "-l", type=click.Choice(["recent", "medium", "long", "all"]), default="all", help="显示的记忆层级")
+@click.option("--level", "-l", type=click.Choice(["recent", "medium", "long", "all"]), default="all", help="Memory level to display")
 def role_memory(name, level):
-    """查看角色的记忆内容"""
+    """View role memory / 查看角色记忆"""
     roles = load_roles()
     
     if name not in roles:
-        console.print(f"[red]错误: 角色 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.role_not_found', name=name)}[/red]")
         sys.exit(1)
     
     memory = load_memory(name)
     
     if level in ["recent", "all"]:
-        console.print(Panel("[bold]短期记忆 (Recent)[/bold]", style="cyan"))
+        console.print(Panel(f"[bold]{t('panel.recent_memory')}[/bold]", style="cyan"))
         if memory["recent"]:
             for msg in memory["recent"][-10:]:  # 只显示最近10条
-                role_label = "[blue]用户[/blue]" if msg["role"] == "user" else "[green]助手[/green]"
+                role_label = f"[blue]{t('memory.user')}[/blue]" if msg["role"] == "user" else f"[green]{t('memory.assistant')}[/green]"
                 content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
                 console.print(f"  {role_label}: {content_preview}")
         else:
-            console.print("  [dim]无[/dim]")
+            console.print(f"  [dim]{t('detail.no_data')}[/dim]")
     
     if level in ["medium", "all"]:
-        console.print(Panel("[bold]中期记忆 (Medium)[/bold]", style="yellow"))
+        console.print(Panel(f"[bold]{t('panel.medium_memory')}[/bold]", style="yellow"))
         if memory["medium"]:
             for i, m in enumerate(memory["medium"], 1):
                 console.print(f"  [{i}] {m['summary']}")
-                console.print(f"      [dim]({m.get('turns', '?')} 轮对话, {m.get('timestamp', '?')})[/dim]")
+                console.print(f"      [dim]{t('memory.turns_info', turns=m.get('turns', '?'), time=m.get('timestamp', '?'))}[/dim]")
         else:
-            console.print("  [dim]无[/dim]")
+            console.print(f"  [dim]{t('detail.no_data')}[/dim]")
     
     if level in ["long", "all"]:
-        console.print(Panel("[bold]长期记忆 (Long)[/bold]", style="green"))
+        console.print(Panel(f"[bold]{t('panel.long_memory')}[/bold]", style="green"))
         if memory["long"]:
             console.print(f"  {memory['long']}")
         else:
-            console.print("  [dim]无[/dim]")
+            console.print(f"  [dim]{t('detail.no_data')}[/dim]")
 
 
 @role_group.command("edit")
 @click.argument("name")
-@click.option("-s", "--system", help="新的系统提示词")
-@click.option("-m", "--model", help="绑定的模型（使用 'none' 清除）")
+@click.option("-s", "--system", help="New system prompt")
+@click.option("-m", "--model", help="Bind model (use 'none' to clear)")
 def role_edit(name, system, model):
-    """编辑角色配置"""
+    """Edit role configuration / 编辑角色配置"""
     roles = load_roles()
     cfg = load_config()
     
     if name not in roles:
-        console.print(f"[red]错误: 角色 '{name}' 不存在[/red]")
+        console.print(f"[red]{t('error.role_not_found', name=name)}[/red]")
         sys.exit(1)
     
     if system:
         roles[name]["system_prompt"] = system
-        console.print("[green]✓ 系统提示词已更新[/green]")
+        console.print(f"[green]✓ {t('success.system_updated')}[/green]")
     
     if model:
         if model.lower() == "none":
             roles[name]["model"] = None
-            console.print("[green]✓ 已清除绑定模型[/green]")
+            console.print(f"[green]✓ {t('success.model_unbound')}[/green]")
         elif model not in cfg["models"]:
-            console.print(f"[red]错误: 模型 '{model}' 不存在[/red]")
+            console.print(f"[red]{t('error.model_not_found', name=model)}[/red]")
             sys.exit(1)
         else:
             roles[name]["model"] = model
-            console.print(f"[green]✓ 已绑定模型 '{model}'[/green]")
+            console.print(f"[green]✓ {t('success.model_bound', name=model)}[/green]")
     
     save_roles(roles)
 
@@ -1119,15 +1196,15 @@ def mcp_group():
 
 @mcp_group.command("list")
 def mcp_list():
-    """列出所有 MCP 服务器"""
+    """List all MCP servers / 列出所有 MCP 服务器"""
     cfg = load_mcp_config()
     servers = cfg.get("mcpServers", {})
     enabled = cfg.get("enabled")
     
     if not servers:
-        console.print("[yellow]尚未配置任何 MCP 服务器[/yellow]")
-        console.print(f"\n编辑配置文件: [cyan]{MCP_FILE}[/cyan]")
-        console.print("\n示例配置:")
+        console.print(f"[yellow]{t('hint.no_mcp')}[/yellow]")
+        console.print(f"\n{t('hint.edit_config', path=str(MCP_FILE))}")
+        console.print(f"\n{t('hint.example_config')}")
         console.print('''[dim]{
   "mcpServers": {
     "filesystem": {
@@ -1138,10 +1215,10 @@ def mcp_list():
 }[/dim]''')
         return
     
-    table = Table(title="MCP 服务器列表")
-    table.add_column("名称", style="cyan")
-    table.add_column("命令", style="green")
-    table.add_column("启用", justify="center")
+    table = Table(title=t("table.mcp_list"))
+    table.add_column(t("table.col.name"), style="cyan")
+    table.add_column(t("table.col.command"), style="green")
+    table.add_column(t("table.col.enabled"), justify="center")
     
     # 如果 enabled 为 None，表示全部启用
     all_enabled = enabled is None
@@ -1157,33 +1234,33 @@ def mcp_list():
         table.add_row(name, cmd_str, is_enabled)
     
     console.print(table)
-    console.print(f"\n配置文件: [cyan]{MCP_FILE}[/cyan]")
+    console.print(f"\n{t('hint.config_file', path=str(MCP_FILE))}")
 
 
 @mcp_group.command("tools")
 @click.argument("name", required=False)
 def mcp_tools(name):
-    """列出 MCP 服务器提供的工具"""
+    """List MCP server tools / 列出 MCP 服务器提供的工具"""
     if not MCP_AVAILABLE:
-        console.print("[red]错误: MCP 支持未安装，请运行: uv sync[/red]")
+        console.print(f"[red]{t('error.mcp_not_installed')}[/red]")
         sys.exit(1)
     
     cfg = load_mcp_config()
     servers = cfg.get("mcpServers", {})
     
     if not servers:
-        console.print("[yellow]尚未配置任何 MCP 服务器[/yellow]")
+        console.print(f"[yellow]{t('hint.no_mcp')}[/yellow]")
         return
     
     if name:
         if name not in servers:
-            console.print(f"[red]错误: MCP 服务器 '{name}' 不存在[/red]")
+            console.print(f"[red]{t('error.mcp_server_not_found', name=name)}[/red]")
             sys.exit(1)
         server_name = name
     else:
         available = get_available_mcp_servers()
         if not available:
-            console.print("[yellow]没有可用的 MCP 服务器[/yellow]")
+            console.print(f"[yellow]{t('hint.no_available_mcp')}[/yellow]")
             return
         server_name = available[0]
     
@@ -1206,20 +1283,20 @@ def mcp_tools(name):
                 result = await session.list_tools()
                 return result.tools
     
-    with console.status(f"[bold green]正在连接 MCP 服务器 '{server_name}'...[/bold green]"):
+    with console.status(f"[bold green]{t('status.connecting_mcp', name=server_name)}[/bold green]"):
         try:
             tools = asyncio.run(list_tools())
         except Exception as e:
-            console.print(f"[red]错误: {e}[/red]")
+            console.print(f"[red]{t('error.general', error=str(e))}[/red]")
             sys.exit(1)
     
     if not tools:
-        console.print("[yellow]服务器没有提供任何工具[/yellow]")
+        console.print(f"[yellow]{t('error.no_mcp_tools')}[/yellow]")
         return
     
-    table = Table(title=f"MCP 工具 ({server_name})")
-    table.add_column("工具名称", style="cyan")
-    table.add_column("描述", style="green")
+    table = Table(title=t("table.mcp_tools", name=server_name))
+    table.add_column(t("table.col.tool_name"), style="cyan")
+    table.add_column(t("table.col.description"), style="green")
     
     for tool in tools:
         desc = tool.description or ""
@@ -1228,17 +1305,17 @@ def mcp_tools(name):
         table.add_row(tool.name, desc)
     
     console.print(table)
-    console.print(f"\n共 {len(tools)} 个工具")
+    console.print(f"\n{t('hint.total_tools', count=len(tools))}")
 
 
 @mcp_group.command("path")
 def mcp_path():
-    """显示 MCP 配置文件路径"""
-    console.print(f"配置文件: [cyan]{MCP_FILE}[/cyan]")
+    """Show MCP config file path / 显示 MCP 配置文件路径"""
+    console.print(f"{t('hint.config_file', path=str(MCP_FILE))}")
     if MCP_FILE.exists():
-        console.print("[green]文件已存在[/green]")
+        console.print(f"[green]{t('hint.file_exists')}[/green]")
     else:
-        console.print("[yellow]文件不存在，请创建[/yellow]")
+        console.print(f"[yellow]{t('hint.file_not_exists')}[/yellow]")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+[English](README_EN.md) | 简体中文 | [日本語](README_JA.md)
+
 基于 LangChain 的终端 LLM 问答工具，支持多模型、角色记忆和 MCP 工具调用。
 
 ## 特性
@@ -26,10 +28,10 @@ pipx install ask-py-cli
 uv tool install ask-py-cli
 ```
 
-### 2. 配置模型
+### 2. 添加模型
 
 ```bash
-ask config add openai \
+ask model add openai \
     -b https://api.openai.com/v1 \
     -k $OPENAI_API_KEY \
     -m gpt-4 \
@@ -42,8 +44,10 @@ ask config add openai \
 # 直接提问
 ask "什么是量子计算？"
 
-# 使用 MCP 工具
+# 使用工具模式（时间查询、Shell 命令等）
 ask -t "现在几点了？"
+ask -t "列出 /tmp 目录的文件"
+ask -t "整理 ~/Downloads 下的视频文件名"
 
 # 创建角色（带记忆）
 ask role add coder -s "你是一个资深程序员" --set-default
@@ -69,10 +73,10 @@ ask [OPTIONS] "问题"
 ### 模型管理
 
 ```bash
-ask config add NAME -b API_BASE -k API_KEY [-m MODEL] [--set-default]
-ask config list
-ask config default NAME
-ask config remove NAME
+ask model add NAME -b API_BASE -k API_KEY [-m MODEL] [--set-default]
+ask model list
+ask model default NAME
+ask model remove NAME
 ```
 
 ### 角色管理
@@ -105,6 +109,7 @@ ask role clear-memory NAME --confirm
 ```yaml
 default: openai
 default_role: coder
+lang: zh-cn  # 语言设置: en, zh-cn, zh-tw (默认根据系统 $LANG 自动检测)
 models:
   openai:
     api_base: https://api.openai.com/v1
@@ -112,6 +117,19 @@ models:
     model: gpt-4
     temperature: 0.7
 ```
+
+### 多语言支持
+
+支持语言：
+- `en` - English
+- `zh-cn` - 简体中文
+- `zh-tw` - 繁體中文
+- `ja` - 日本語
+
+语言检测优先级：
+1. 配置文件中的 `lang` 设置
+2. 环境变量 `$LANG`
+3. 默认使用英文
 
 ## 记忆系统
 
@@ -129,7 +147,7 @@ MCP（Model Context Protocol）让 LLM 能够调用外部工具。
 
 ### 默认配置
 
-首次运行自动创建 `~/.config/ask/mcp.json`：
+首次运行自动创建 `~/.config/ask/mcp.json`，会自动检测系统中的 `uvx` 或 `pipx` 命令：
 
 ```json
 {
@@ -137,11 +155,22 @@ MCP（Model Context Protocol）让 LLM 能够调用外部工具。
     "time": {
       "command": "uvx",
       "args": ["mcp-server-time"]
+    },
+    "shell": {
+      "command": "uvx",
+      "args": ["mcp-shell-server"],
+      "env": {
+        "ALLOW_COMMANDS": "ls,cat,head,tail,find,grep,wc,pwd,echo,mkdir,cp,mv,touch,date"
+      }
     }
   },
-  "enabled": ["time"]
+  "enabled": ["time", "shell"]
 }
 ```
+
+- `time`: 查询时间
+- `shell`: 执行系统命令（通过 `ALLOW_COMMANDS` 限制可用命令）
+- 自动检测：优先使用 `uvx`，不存在则使用 `pipx`
 
 ### 添加更多服务器
 
@@ -162,9 +191,10 @@ MCP（Model Context Protocol）让 LLM 能够调用外部工具。
 
 ```bash
 ask mcp list              # 查看服务器
-ask mcp tools time        # 查看工具列表
-ask -t "现在几点？"        # 使用默认启用的工具
-ask --mcp fetch "获取网页" # 指定服务器
+ask mcp tools shell       # 查看 shell 工具详情
+ask -t "现在几点？"        # 使用默认启用的工具（time + shell）
+ask -t "列出 /tmp 目录文件"          # LLM 自动调用 shell
+ask -t "整理 ~/Videos 下的视频文件名" # LLM 自动规划并执行命令
 ```
 
 ### 角色级 MCP

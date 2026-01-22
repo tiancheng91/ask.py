@@ -26,7 +26,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ask-py"
+name = "ask-py-cli"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
