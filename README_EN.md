@@ -8,6 +8,16 @@ English | [简体中文](README.md) | [日本語](README_JA.md)
 
 A terminal LLM Q&A tool based on LangChain, with multi-model support, role memory, and MCP tool integration.
 
+## Why Choose ask.py
+
+Compared to traditional AI Agent frameworks, `ask.py` focuses on a **lightweight, fast, and terminal-friendly** design:
+
+- **Extremely Lightweight**: No complex Agent framework required, low resource usage, fast response
+- **Terminal-First**: Get answers with `ask "question"`, streaming output, seamlessly integrated into terminal workflows
+- **Focused on Core Scenarios**: Perfect for quick queries, code analysis, and error diagnosis in daily development
+
+Enjoy a lightweight AI Q&A experience without starting heavy Agent frameworks.
+
 ## Features
 
 - 🚀 Quick terminal Q&A - just `ask "question"`
