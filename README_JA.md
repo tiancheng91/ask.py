@@ -6,7 +6,7 @@
 
 [English](README_EN.md) | [简体中文](README.md) | 日本語
 
-LangChain ベースのターミナル LLM Q&A ツール。マルチモデル、ロールメモリ、MCP ツール連携をサポート。
+ターミナル LLM Q&A ツール。マルチモデル、ロールメモリ、MCP ツール連携をサポート。
 
 ## ask.py を選ぶ理由
 

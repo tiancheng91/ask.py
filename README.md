@@ -6,7 +6,7 @@
 
 [English](README_EN.md) | 简体中文 | [日本語](README_JA.md)
 
-基于 LangChain 的终端 LLM 问答工具，支持多模型、角色记忆和 MCP 工具调用。
+终端 LLM 问答工具，支持多模型、角色记忆和 MCP 工具调用。
 
 ## 为什么选择 ask.py
 

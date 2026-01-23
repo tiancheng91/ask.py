@@ -6,7 +6,7 @@
 
 English | [简体中文](README.md) | [日本語](README_JA.md)
 
-A terminal LLM Q&A tool based on LangChain, with multi-model support, role memory, and MCP tool integration.
+A terminal LLM Q&A tool with multi-model support, role memory, and MCP tool integration.
 
 ## Why Choose ask.py
 
